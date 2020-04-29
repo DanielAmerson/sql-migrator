@@ -103,5 +103,8 @@ venv.bak/
 # mypy
 .mypy_cache/
 
+# IDE files
+.idea/
+
 # Files that contain secrets
 migration_config.ini

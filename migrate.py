@@ -1,6 +1,8 @@
 import configparser
 import glob
 import os
+import secrets
+import string
 import sys
 from datetime import datetime
 
@@ -19,7 +21,7 @@ CREATE_MIGRATIONS_TABLE_STATEMENT = text("""
     WITH (
       OIDS = FALSE
     );
-    
+
     CREATE TABLE IF NOT EXISTS dependent_revision
     (
        "ParentRevision" character varying(255) NOT NULL,
@@ -37,11 +39,27 @@ CREATE_MIGRATIONS_TABLE_STATEMENT = text("""
     );
 """)
 
+CREATE_SCHEMA_STATEMENT = "CREATE SCHEMA IF NOT EXISTS {schema} AUTHORIZATION {admin_user};"
+
+FIND_USER_STATEMENT = text("SELECT 1 FROM pg_roles WHERE rolname=:user_name")
+
+CREATE_USER_STATEMENT = """
+    CREATE USER {user_name} WITH
+    LOGIN
+    NOSUPERUSER
+    NOCREATEDB
+    NOCREATEROLE
+    INHERIT
+    NOREPLICATION
+    CONNECTION LIMIT -1
+    ENCRYPTED PASSWORD '{default_password}';
+"""
+
 READ_ONLY_ACCESS_STATEMENT = """
     set search_path = {schema};
 
     GRANT SELECT ON TABLE revision TO GROUP {user};
-    
+
     GRANT SELECT ON TABLE dependent_revision TO GROUP {user};
 """
 
@@ -53,31 +71,31 @@ INSERT_REVISION_TEMPLATE = text("""
 
 INSERT_DEPENDENT_REVISION_TEMPLATE = text("""
     set search_path = :schema;
-    
+
     INSERT INTO dependent_revision("ParentRevision", "DependentRevision") VALUES (:parent, :dependent);
 """)
 
 DELETE_REVISION_TEMPLATE = text("""
     set search_path = :schema;
-    
+
     DELETE FROM revision WHERE "Revision" = :revision_name;
 """)
 
 DELETE_DEPENDENT_REVISION_TEMPLATE = text("""
     set search_path = :schema;
-    
+
     DELETE FROM dependent_revision where "DependentRevision" = :revision_name;
 """)
 
 FIND_PREVIOUSLY_RUN_MIGRATIONS = text("""
     set search_path = :schema;
-    
+
     SELECT * FROM revision;
 """)
 
 FIND_DEPENDENT_REVISIONS = text("""
     set search_path = :schema;
-    
+
     SELECT "DependentRevision" from dependent_revision WHERE "ParentRevision" = :revision_name;
 """)
 
@@ -88,18 +106,33 @@ MIGRATION_FILENAME_TEMPLATE = '{time}_{name}'
 CURRENT_DIRECTORY = os.path.dirname(os.path.realpath(__file__))
 
 
-def initialize_project(connection_string, schema, read_only_users):
-    print('Adding revision and dependent_revision tables to the database.')
+def initialize_project(connection_string, schema, read_only_users, new_user_default_password):
     db_engine = create_engine(connection_string)
     with db_engine.begin() as connection:
+        print('Creating schema {schema} if it does not already exist.'.format(schema=schema))
+        connection.execute(
+            CREATE_SCHEMA_STATEMENT.format(
+                schema=schema, admin_user=_admin_user_from_connection_string(connection_string)
+            )
+        )
+
+        print('Adding revision and dependent_revision tables to the database.')
         connection.execute(CREATE_MIGRATIONS_TABLE_STATEMENT, schema=schema)
 
-        # the following is bad practice as buiding a statement this way could lead to sql injection, BUUUUUUT since
-        # this is a tool to be run by someone that already has the password to the database this isn't much of a
-        # vulnerability.  this is only necessary because user names can't get inserted into sqlalchemy text objects
-        # without getting surrounded by quotes which in turn breaks the statement.
+        # the following block uses some bad practices as building a statement with format() could lead to sql injection,
+        # BUUUUUUT since this is a tool to be run by someone that already has the password to the database this isn't
+        # much of a vulnerability.  this is only necessary because user names can't get inserted into sqlalchemy text
+        # objects without getting surrounded by quotes which in turn breaks the statement.
         if read_only_users:
             for user in read_only_users:
+                result = connection.execute(FIND_USER_STATEMENT, user_name=user).fetchone()
+                if result is None:
+                    password = new_user_default_password if new_user_default_password else _generate_password()
+                    print('Creating user {user} with password {password}.'.format(user=user, password=password))
+                    connection.execute(CREATE_USER_STATEMENT.format(user_name=user, default_password=password))
+                else:
+                    print('User {user} already exists and will be unchanged by this process.'.format(user=user))
+
                 connection.execute(READ_ONLY_ACCESS_STATEMENT.format(schema=schema, user=user))
 
 
@@ -119,7 +152,8 @@ def create_revision(name, schema):
     previous_migration = '' if not all_revisions else \
         (PREDECESSOR_MARKER + ' ' + all_revisions[-1][:-4].replace(migrations_directory, ''))
 
-    up_template = Template(filename=template_path).render(schema=schema, mode='up', previous_migration=previous_migration)
+    up_template = Template(filename=template_path).render(schema=schema, mode='up',
+                                                          previous_migration=previous_migration)
     down_template = Template(filename=template_path).render(schema=schema, mode='down')
 
     print('Outputting scripts...', end='')
@@ -140,7 +174,9 @@ def apply_migrations(connection_string, schema):
 
     migrations_directory = CURRENT_DIRECTORY + '/up/'
     all_revisions = glob.glob(migrations_directory + '*.sql')
-    revision_to_file = {filename.replace(migrations_directory, '').replace('.sql', ''):filename for filename in all_revisions}
+    revision_to_file = {
+        filename.replace(migrations_directory, '').replace('.sql', ''): filename for filename in all_revisions
+    }
 
     for applied_migration in applied_migrations:
         if applied_migration in revision_to_file:  # should always be true
@@ -224,7 +260,7 @@ def _apply_revisions_to_database(db_engine, revision_to_file, revision_to_predec
                     # predecessor has been applied so we can delete the dependency
                     predecessors[1].remove(revision)
 
-        # all revisions without predecessors have been applied so now check the new state of the list and loop again if needed
+        # all revisions without predecessors have been applied so now check the new state and loop again if needed
         revisions_with_no_outstanding_predecessors = \
             [revision for revision in revision_to_predecessors if not revision_to_predecessors[revision][1]]
         all_migrations_applied = len(revisions_with_no_outstanding_predecessors) == 0
@@ -245,9 +281,19 @@ def _create_directory(directory_name):
         print('Created /{0} directory.'.format(directory_name))
 
 
+def _admin_user_from_connection_string(connection_string):
+    username_password_section = connection_string.split('@')[0]
+    username_password_section = username_password_section.split('://')[-1]
+    return username_password_section.split(':')[0]
+
+
+def _generate_password():
+    return ''.join(secrets.choice(string.ascii_letters + string.digits) for _ in range(12))
+
+
 if __name__ == '__main__':
     if len(sys.argv) < 2:
-        print('Usage: migrate.py <action> (<migration-name>)')
+        print('Usage: migrate.py <action> (<migration-name>|<default-password>)')
 
         sys.exit(1)
     else:
@@ -281,7 +327,15 @@ if __name__ == '__main__':
             sys.exit(1)
 
     if sys.argv[1] == 'init':
-        initialize_project(connection_string_value, schema_name_value, application_users_value)
+        default_password = None
+        if len(sys.argv) == 3:
+            default_password = sys.argv[2]
+        elif application_users_value:
+            print('ApplicationUsers were defined in the migration_config.ini file, but no default password was '
+                  'provided.  If any users are to be created by this process a randomly generated password will be '
+                  'generated and displayed.')
+
+        initialize_project(connection_string_value, schema_name_value, application_users_value, default_password)
     elif sys.argv[1] == 'up':
         apply_migrations(connection_string_value, schema_name_value)
     elif sys.argv[1] == 'down':
