@@ -55,12 +55,15 @@ CREATE_USER_STATEMENT = """
     ENCRYPTED PASSWORD '{default_password}';
 """
 
+# TODO apply schema permission logic only if new user is created
 READ_ONLY_ACCESS_STATEMENT = """
     set search_path = {schema};
 
     GRANT SELECT ON TABLE revision TO GROUP {user};
 
     GRANT SELECT ON TABLE dependent_revision TO GROUP {user};
+
+    GRANT ALL ON SCHEMA {schema} TO {user};
 """
 
 INSERT_REVISION_TEMPLATE = text("""
